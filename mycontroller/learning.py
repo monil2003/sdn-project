@@ -122,14 +122,21 @@ class FlowDatabase(object):
 
 class LearningEngine(object):
 
-    def __init__(self, connection, topology):
+    def __init__(self, connection, topology, lldp, routing, switch_manager, path, host_db):
 
         self.connection = connection
+
         self.topology = topology
 
-        self.mac_to_port = {}
+        self.lldp = lldp
 
-        self.installed_flows = set()
+        self.routing = routing
+
+        self.switch_manager = switch_manager
+
+        self.path = path
+
+        self.host_db = host_db
 
         self.stats_interval = DEFAULT_STATS_INTERVAL
 
@@ -144,6 +151,12 @@ class LearningEngine(object):
         Timer(
             self.stats_interval,
             self.request_flow_stats,
+            recurring=True
+        )
+
+        Timer(
+            5,
+            self.send_lldp,
             recurring=True
         )
 
@@ -275,110 +288,14 @@ class LearningEngine(object):
         log.info("=" * 110)
 
         for flow_key in idle_flows:
+            if self.path.remove_path(
+                flow_key[0],
+                flow_key[1]
+            ):
 
-            self.remove_flow(
-                flow_key
-            )
-
-    def install_flow(
-        self,
-        event,
-        packet,
-        out_port
-    ):
-
-        flow_key = (
-            str(packet.src),
-            str(packet.dst)
-        )
-
-        if flow_key in self.installed_flows:
-
-            log.info(
-                "Flow already installed %s -> %s",
-                packet.src,
-                packet.dst
-            )
-
-            msg = of.ofp_packet_out()
-
-            msg.data = event.ofp
-
-            msg.actions.append(
-                of.ofp_action_output(
-                    port=out_port
+                self.flow_db.remove(
+                    flow_key
                 )
-            )
-
-            self.connection.send(msg)
-
-            return
-
-        msg = of.ofp_flow_mod()
-
-        msg.match = of.ofp_match.from_packet(
-            packet,
-            event.port
-        )
-
-        msg.actions.append(
-            of.ofp_action_output(
-                port=out_port
-            )
-        )
-
-        msg.data = event.ofp
-
-        self.connection.send(msg)
-
-        self.installed_flows.add(
-            flow_key
-        )
-
-        log.info(
-            "Installed NEW flow %s -> %s (port %d -> %d)",
-            packet.src,
-            packet.dst,
-            event.port,
-            out_port
-        )
-
-    def remove_flow(
-        self,
-        flow_key
-    ):
-
-        stats = self.flow_db.get(
-            flow_key
-        )
-
-        if stats is None:
-            return False
-
-        msg = of.ofp_flow_mod()
-
-        msg.command = of.OFPFC_DELETE
-
-        msg.match = stats["match"]
-
-        self.connection.send(msg)
-
-        self.installed_flows.discard(
-            flow_key
-        )
-
-        self.flow_db.remove(
-            flow_key
-        )
-
-        log.info(
-            "Deleted idle flow %s -> %s (idle %d seconds)",
-            flow_key[0],
-            flow_key[1],
-            self.idle_timeout
-        )
-
-        return True
 
     def _handle_PacketIn(
         self,
@@ -395,51 +312,147 @@ class LearningEngine(object):
 
             return
 
+        if self.lldp.is_lldp(packet):
+
+            result = self.lldp.parse_packet(
+                packet
+            )
+
+            if result is None:
+                return
+
+            src_switch, src_port = result
+
+            dst_switch = self.connection.dpid
+
+            dst_port = event.port
+
+            changed = self.topology.add_link(
+                src_switch,
+                src_port,
+                dst_switch,
+                dst_port
+            )
+
+            if changed:
+
+                self.topology.print_topology()
+
+            return
+
         if packet.type == 0x86DD:
             return
 
         src = packet.src
+
         dst = packet.dst
+
         in_port = event.port
 
-        self.mac_to_port[src] = in_port
-
-        log.info(
-            "Packet: %s -> %s type=%s in_port=%d",
-            src,
-            dst,
-            packet.type,
+        if self.topology.is_edge_port(
+            self.connection.dpid,
             in_port
+        ):
+
+            changed = self.host_db.learn(
+                str(src),
+                self.connection.dpid,
+                in_port
+            )
+
+            if changed:
+
+                self.host_db.print_hosts()
+
+        src_host = self.host_db.get(
+            str(src)
         )
 
-        if dst not in self.mac_to_port:
+        dst_host = self.host_db.get(
+            str(dst)
+        )
 
+        if (
+            src_host is not None
+            and
+            dst_host is not None
+            and
+            self.connection.dpid == src_host.switch
+        ):
+            if src_host.switch != dst_host.switch:
+                path = self.routing.shortest_path(src_host.switch,dst_host.switch)
+                if path is None:
+                    return
+                if self.path.has_path(
+                    str(src),
+                    str(dst)
+                ):
+                    return
+                self.path.install_path(
+                    str(src),
+                    str(dst),
+                    path,
+                    event
+                )
+                return
+
+        if dst_host is None:
             log.info(
                 "Unknown destination %s, flooding",
                 dst
             )
+            self.flood_packet(
+                event
+            )
+            return
+
+
+    def send_lldp(self):
+        features = self.connection.features
+
+        if features is None:
+            return
+
+        for port in features.ports:
+            port_no = port.port_no
+            if (port_no > of.OFPP_MAX or port_no == of.OFPP_LOCAL):
+                continue
+            pkt = self.lldp.build_packet(
+                self.connection.dpid,
+                port_no,
+                port.hw_addr
+            )
 
             msg = of.ofp_packet_out()
-
-            msg.data = event.ofp
-
+            msg.data = pkt.pack()
             msg.actions.append(
                 of.ofp_action_output(
-                    port=of.OFPP_FLOOD
+                    port=port_no
                 )
             )
 
             self.connection.send(msg)
 
-            return
+        log.info(
+            "Sent LLDP packets from switch %s",
+            self.connection.dpid
+        )
 
-        out_port = self.mac_to_port[dst]
+    def flood_packet(
+        self,
+        event
+    ):
 
-        if out_port == in_port:
-            return
+        msg = of.ofp_packet_out()
 
-        self.install_flow(
-            event,
-            packet,
-            out_port
+        msg.data = event.ofp
+
+        msg.actions.append(
+            of.ofp_action_output(
+                port=of.OFPP_FLOOD
+            )
+        )
+
+        self.connection.send(
+            msg
         )
