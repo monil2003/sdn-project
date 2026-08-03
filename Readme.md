@@ -281,13 +281,7 @@ Switch 3 -> output port 1
 Flow Statistics
 
 ```
-Source MAC          Destination MAC
-
-Packets
-
-Bytes
-
-Age
+Source MAC    Destination MAC    Packets    Bytes   Age
 ```
 
 Idle Flow Removal
@@ -295,11 +289,7 @@ Idle Flow Removal
 ```
 Removed path
 
-5e:3d:25:de:f0:59
-
-->
-
-02:f5:e3:f8:cc:9b
+5e:3d:25:de:f0:59 -> 02:f5:e3:f8:cc:9b
 ```
 
 ---
